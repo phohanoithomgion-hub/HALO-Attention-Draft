@@ -1,0 +1,307 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+def ssd_forward(u, dt, A, B, C, chunk_size=64):
+    b, n, h = u.shape
+    s = B.shape[-1]
+    device = u.device
+
+    pad = (chunk_size - n % chunk_size) % chunk_size
+    if pad > 0:
+        u = F.pad(u, (0, 0, 0, pad))
+        dt = F.pad(dt, (0, 0, 0, pad))
+        B = F.pad(B, (0, 0, 0, pad))
+        C = F.pad(C, (0, 0, 0, pad))
+    n_p = n + pad
+    nc = n_p // chunk_size
+
+    u_c = u.view(b, nc, chunk_size, h)
+    dt_c = dt.view(b, nc, chunk_size, h)
+    B_c = B.view(b, nc, chunk_size, s)
+    C_c = C.view(b, nc, chunk_size, s)
+
+    dA = torch.exp(dt_c.unsqueeze(-1) * A.view(1, 1, 1, h, s))
+    dB = dt_c.unsqueeze(-1) * B_c.unsqueeze(3)
+
+    h_state = torch.zeros(b, h, s, device=device, dtype=u.dtype)
+    y_out = torch.zeros(b, nc, chunk_size, h, device=device, dtype=u.dtype)
+
+    for c in range(nc):
+        cumA = torch.cumprod(dA[:, c], dim=1)
+        v_t = (dB[:, c] * u_c[:, c].unsqueeze(-1)) / (cumA + 1e-10)
+        cum_v = torch.cumsum(v_t, dim=1)
+        h_t = cumA * (h_state.unsqueeze(1) + cum_v)
+        y_out[:, c] = (h_t * C_c[:, c].unsqueeze(2)).sum(-1)
+        h_state = h_t[:, -1]
+
+    return y_out.view(b, n_p, h)[:, :n]
+
+
+def sliding_window_attention(q, k, v, window):
+    b, h, n, d = q.shape
+    out = torch.zeros_like(q)
+
+    for start in range(0, n, window):
+        end = min(start + window, n)
+        k_start = max(0, start - window + 1)
+
+        q_blk = q[:, :, start:end]
+        k_blk = k[:, :, k_start:end]
+        v_blk = v[:, :, k_start:end]
+
+        scores = torch.einsum('bhid,bhjd->bhij', q_blk, k_blk) / math.sqrt(d)
+
+        q_idx = torch.arange(start, end, device=q.device).unsqueeze(1)
+        k_idx = torch.arange(k_start, end, device=q.device).unsqueeze(0)
+        mask = (k_idx <= q_idx) & (k_idx > q_idx - window)
+
+        scores = scores.masked_fill(~mask, float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        out[:, :, start:end] = torch.einsum('bhij,bhjd->bhid', attn, v_blk)
+
+    return out
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_ff, d_model, bias=False)
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Mamba2Block(nn.Module):
+    def __init__(self, d_model, d_state=128, d_conv=4, expand=2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_inner = d_model * expand
+
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner + 2 * d_state + self.d_inner, bias=False)
+        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=d_conv,
+                                padding=d_conv - 1, groups=self.d_inner)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=False)
+        self.dt_bias = nn.Parameter(torch.zeros(self.d_inner))
+
+        A_init = torch.arange(1, d_state + 1).float()
+        self.A_log = nn.Parameter(torch.log(A_init).unsqueeze(0).expand(self.d_inner, -1).contiguous())
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, u):
+        b, n, _ = u.shape
+
+        xzBCdt = self.in_proj(u)
+        x, z, B, C, dt_raw = torch.split(
+            xzBCdt,
+            [self.d_inner, self.d_inner, self.d_state, self.d_state, self.d_inner],
+            dim=-1,
+        )
+
+        x = self.conv1d(x.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        x = F.silu(x)
+
+        dt = F.softplus(self.dt_proj(dt_raw) + self.dt_bias)
+        A = -torch.exp(self.A_log)
+
+        y = ssd_forward(x, dt, A, B, C)
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * x
+        y = y * F.silu(z)
+
+        out = self.out_proj(y)
+        return out, dt
+
+
+class HyperLoRAGenerator(nn.Module):
+    def __init__(self, d_model, n_blocks, rank=4, n_sinks=8, hidden=128):
+        super().__init__()
+        self.d_model = d_model
+        self.n_blocks = n_blocks
+        self.rank = rank
+        self.n_sinks = n_sinks
+
+        self.per_block_out = 6 * d_model * rank + 2 * n_sinks * d_model
+
+        self.trunk = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.block_emb = nn.Parameter(torch.zeros(n_blocks, hidden))
+        self.head = nn.Linear(hidden, self.per_block_out)
+
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, g, block_idx):
+        b = g.shape[0]
+        h = self.trunk(g) + self.block_emb[block_idx].unsqueeze(0)
+        out = self.head(h)
+
+        d = self.d_model
+        r = self.rank
+        ns = self.n_sinks
+
+        A_K = out[:, :d * r].view(b, r, d)
+        B_K = out[:, d * r:2 * d * r].view(b, d, r)
+        A_V = out[:, 2 * d * r:3 * d * r].view(b, r, d)
+        B_V = out[:, 3 * d * r:4 * d * r].view(b, d, r)
+        A_O = out[:, 4 * d * r:5 * d * r].view(b, r, d)
+        B_O = out[:, 5 * d * r:6 * d * r].view(b, d, r)
+        dZ_K = out[:, 6 * d * r:6 * d * r + ns * d].view(b, ns, d)
+        dZ_V = out[:, 6 * d * r + ns * d:].view(b, ns, d)
+
+        return {
+            'A_K': A_K, 'B_K': B_K,
+            'A_V': A_V, 'B_V': B_V,
+            'A_O': A_O, 'B_O': B_O,
+            'dZ_K': dZ_K, 'dZ_V': dZ_V,
+        }
+
+
+class HALOLayer(nn.Module):
+    def __init__(self, d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.window = window
+        self.topk = topk
+        self.n_sinks = n_sinks
+
+        self.mamba = Mamba2Block(d_model, d_state, expand=expand)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.scale_K = nn.Parameter(torch.ones(1))
+        self.scale_V = nn.Parameter(torch.ones(1))
+        self.scale_O = nn.Parameter(torch.ones(1))
+
+        self.imp_proj = nn.Linear(d_model, 1, bias=False)
+        self.imp_lambda = nn.Parameter(torch.zeros(1))
+
+        self.sink_K = nn.Parameter(torch.randn(n_sinks, d_model) * 0.02)
+        self.sink_V = nn.Parameter(torch.randn(n_sinks, d_model) * 0.02)
+
+        self.qc_A = nn.Linear(d_model, lora_rank, bias=False)
+        self.qc_B = nn.Linear(lora_rank, d_model, bias=False)
+
+        self.gate = nn.Linear(d_model, d_model, bias=False)
+        self.ffn = SwiGLU(d_model, d_model * 2)
+
+    def forward(self, x, halora):
+        b, n, d = x.shape
+
+        x_norm = self.norm1(x)
+        H, dt = self.mamba(x_norm)
+        x = x + H
+
+        x_norm = self.norm2(x)
+
+        q_flat = self.q_proj(x_norm)
+        k_flat = self.k_proj(x_norm) + torch.einsum(
+            'bnr,bdr->bnd',
+            torch.einsum('bnd,brd->bnr', x_norm, halora['A_K']),
+            halora['B_K'],
+        ) * self.scale_K
+        v_flat = self.v_proj(x_norm) + torch.einsum(
+            'bnr,bdr->bnd',
+            torch.einsum('bnd,brd->bnr', x_norm, halora['A_V']),
+            halora['B_V'],
+        ) * self.scale_V
+
+        q = q_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+
+        A_local = sliding_window_attention(q, k, v, self.window)
+
+        imp = torch.sigmoid(self.imp_proj(H) + self.imp_lambda * dt.mean(-1, keepdim=True))
+        tk = min(self.topk, n)
+        _, idx = torch.topk(imp.squeeze(-1), tk, dim=-1)
+
+        idx_kv = idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, tk, self.head_dim)
+        k_imp = torch.gather(k, 2, idx_kv)
+        v_imp = torch.gather(v, 2, idx_kv)
+
+        sink_K = (self.sink_K.unsqueeze(0) + halora['dZ_K']).view(
+            b, self.n_sinks, self.n_heads, self.head_dim
+        ).permute(0, 2, 1, 3)
+        sink_V = (self.sink_V.unsqueeze(0) + halora['dZ_V']).view(
+            b, self.n_sinks, self.n_heads, self.head_dim
+        ).permute(0, 2, 1, 3)
+
+        K_long = torch.cat([k_imp, sink_K], dim=2)
+        V_long = torch.cat([v_imp, sink_V], dim=2)
+
+        q_corrected_flat = q_flat + self.qc_B(F.silu(self.qc_A(q_flat)))
+        q_corrected = q_corrected_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+
+        scores_long = torch.einsum('bhd,bhkd->bhk', q_corrected, K_long) / math.sqrt(self.head_dim)
+        attn_long = F.softmax(scores_long, dim=-1)
+        A_long = torch.einsum('bhk,bhkd->bhd', attn_long, V_long)
+
+        A_local_flat = A_local.transpose(1, 2).reshape(b, n, d)
+        A_long_flat = A_long.transpose(1, 2).reshape(b, n, d)
+
+        gate = torch.sigmoid(self.gate(x_norm))
+        A_flat = gate * A_local_flat + (1 - gate) * A_long_flat
+
+        A_out = self.o_proj(A_flat) + torch.einsum(
+            'bnr,bdr->bnd',
+            torch.einsum('bnd,brd->bnr', A_flat, halora['A_O']),
+            halora['B_O'],
+        ) * self.scale_O
+
+        x = x + A_out
+        x = x + self.ffn(self.norm3(x))
+        return x
+
+
+class HALOModel(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, window=256, topk=32,
+                 n_sinks=8, d_state=128, expand=2, lora_rank=4, group_size=4):
+        super().__init__()
+        assert n_layers % group_size == 0
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.n_blocks = n_layers // group_size
+        self.group_size = group_size
+
+        self.embed = nn.Embedding(vocab_size, d_model)
+
+        self.layers = nn.ModuleList([
+            HALOLayer(d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank)
+            for _ in range(n_layers)
+        ])
+
+        self.hyperlora = HyperLoRAGenerator(d_model, self.n_blocks, rank=lora_rank, n_sinks=n_sinks)
+
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.final_norm = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+        g = self.pool_norm(x.mean(dim=1))
+
+        for block_idx in range(self.n_blocks):
+            halora = self.hyperlora(g, block_idx)
+            for layer_in_block in range(self.group_size):
+                layer_idx = block_idx * self.group_size + layer_in_block
+                x = self.layers[layer_idx](x, halora)
+
+        x = self.final_norm(x)
+        return self.lm_head(x)
