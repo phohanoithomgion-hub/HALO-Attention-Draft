@@ -7,8 +7,7 @@ import math
 def ssd_forward(u, dt, A, B, C, chunk_size=64):
     b, n, h = u.shape
     s = B.shape[-1]
-    device = u.device
-
+    
     pad = (chunk_size - n % chunk_size) % chunk_size
     if pad > 0:
         u = F.pad(u, (0, 0, 0, pad))
@@ -17,26 +16,30 @@ def ssd_forward(u, dt, A, B, C, chunk_size=64):
         C = F.pad(C, (0, 0, 0, pad))
     n_p = n + pad
     nc = n_p // chunk_size
-
-    u_c = u.view(b, nc, chunk_size, h)
-    dt_c = dt.view(b, nc, chunk_size, h)
-    B_c = B.view(b, nc, chunk_size, s)
-    C_c = C.view(b, nc, chunk_size, s)
-
-    dA = torch.exp(dt_c.unsqueeze(-1) * A.view(1, 1, 1, h, s))
-    dB = dt_c.unsqueeze(-1) * B_c.unsqueeze(3)
-
-    h_state = torch.zeros(b, h, s, device=device, dtype=u.dtype)
-    y_out = torch.zeros(b, nc, chunk_size, h, device=device, dtype=u.dtype)
-
+    
+    u = u.view(b, nc, chunk_size, h)
+    dt = dt.view(b, nc, chunk_size, h)
+    B = B.view(b, nc, chunk_size, s)
+    C = C.view(b, nc, chunk_size, s)
+    
+    dtA = dt.unsqueeze(-1) * A.view(1, 1, 1, h, s)
+    cumA = torch.cumsum(dtA, dim=2)
+    
+    L = torch.exp(cumA.unsqueeze(3) - cumA.unsqueeze(2))
+    L = torch.tril(L, diagonal=0)
+    
+    dBu = dt.unsqueeze(-1) * B.unsqueeze(3) * u.unsqueeze(-1)
+    
+    h_chunk = torch.einsum('bcijhs,bcjhs->bcihs', L, dBu)
+    
+    h_start = torch.zeros(b, h, s, device=u.device, dtype=u.dtype)
+    y_out = torch.zeros(b, nc, chunk_size, h, device=u.device, dtype=u.dtype)
+    
     for c in range(nc):
-        cumA = torch.cumprod(dA[:, c], dim=1)
-        v_t = (dB[:, c] * u_c[:, c].unsqueeze(-1)) / (cumA + 1e-10)
-        cum_v = torch.cumsum(v_t, dim=1)
-        h_t = cumA * (h_state.unsqueeze(1) + cum_v)
-        y_out[:, c] = (h_t * C_c[:, c].unsqueeze(2)).sum(-1)
-        h_state = h_t[:, -1]
-
+        h_c = h_chunk[:, c] + torch.exp(cumA[:, c]) * h_start.unsqueeze(1)
+        y_out[:, c] = (h_c * C[:, c].unsqueeze(2)).sum(-1)
+        h_start = h_c[:, -1]
+        
     return y_out.view(b, n_p, h)[:, :n]
 
 
@@ -228,13 +231,36 @@ class HALOLayer(nn.Module):
 
         A_local = sliding_window_attention(q, k, v, self.window)
 
-        imp = torch.sigmoid(self.imp_proj(H) + self.imp_lambda * dt.mean(-1, keepdim=True))
-        tk = min(self.topk, n)
-        _, idx = torch.topk(imp.squeeze(-1), tk, dim=-1)
-
-        idx_kv = idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, tk, self.head_dim)
-        k_imp = torch.gather(k, 2, idx_kv)
-        v_imp = torch.gather(v, 2, idx_kv)
+        imp = torch.sigmoid(self.imp_proj(H) + self.imp_lambda * dt.mean(-1, keepdim=True)).squeeze(-1)
+        
+        chunk_size = 512
+        idx_list = []
+        for i in range(0, n, chunk_size):
+            end = min(i + chunk_size, n)
+            q_idx = torch.arange(i, end, device=x.device).unsqueeze(1)
+            k_idx = torch.arange(0, end, device=x.device).unsqueeze(0)
+            mask = q_idx >= k_idx
+            
+            imp_past = imp[:, :end].unsqueeze(1).expand(b, end - i, end)
+            imp_masked = imp_past.masked_fill(~mask, -1e9)
+            
+            tk = min(self.topk, end)
+            _, chunk_idx = torch.topk(imp_masked, tk, dim=-1)
+            
+            if tk < self.topk:
+                pad_idx = torch.zeros(b, end - i, self.topk - tk, dtype=torch.long, device=x.device)
+                chunk_idx = torch.cat([chunk_idx, pad_idx], dim=-1)
+                
+            idx_list.append(chunk_idx)
+            
+        idx = torch.cat(idx_list, dim=1)
+        
+        idx_kv = idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, n, self.topk, self.head_dim)
+        k_exp = k.unsqueeze(3).expand(b, self.n_heads, n, self.topk, self.head_dim)
+        v_exp = v.unsqueeze(3).expand(b, self.n_heads, n, self.topk, self.head_dim)
+        
+        k_imp = torch.gather(k_exp, 2, idx_kv)
+        v_imp = torch.gather(v_exp, 2, idx_kv)
 
         sink_K = (self.sink_K.unsqueeze(0) + halora['dZ_K']).view(
             b, self.n_sinks, self.n_heads, self.head_dim
@@ -243,15 +269,18 @@ class HALOLayer(nn.Module):
             b, self.n_sinks, self.n_heads, self.head_dim
         ).permute(0, 2, 1, 3)
 
-        K_long = torch.cat([k_imp, sink_K], dim=2)
-        V_long = torch.cat([v_imp, sink_V], dim=2)
+        sink_K = sink_K.unsqueeze(2).expand(b, self.n_heads, n, self.n_sinks, self.head_dim)
+        sink_V = sink_V.unsqueeze(2).expand(b, self.n_heads, n, self.n_sinks, self.head_dim)
+
+        K_long = torch.cat([k_imp, sink_K], dim=3)
+        V_long = torch.cat([v_imp, sink_V], dim=3)
 
         q_corrected_flat = q_flat + self.qc_B(F.silu(self.qc_A(q_flat)))
         q_corrected = q_corrected_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scores_long = torch.einsum('bhd,bhkd->bhk', q_corrected, K_long) / math.sqrt(self.head_dim)
+        scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_corrected, K_long) / math.sqrt(self.head_dim)
         attn_long = F.softmax(scores_long, dim=-1)
-        A_long = torch.einsum('bhk,bhkd->bhd', attn_long, V_long)
+        A_long = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
 
         A_local_flat = A_local.transpose(1, 2).reshape(b, n, d)
         A_long_flat = A_long.transpose(1, 2).reshape(b, n, d)
@@ -295,7 +324,8 @@ class HALOModel(nn.Module):
 
     def forward(self, input_ids):
         x = self.embed(input_ids)
-        g = self.pool_norm(x.mean(dim=1))
+        
+        g = self.pool_norm(x[:, 0])
 
         for block_idx in range(self.n_blocks):
             halora = self.hyperlora(g, block_idx)
