@@ -22,27 +22,34 @@ def ssd_forward(u, dt, A, B, C, chunk_size=16):
     B = B.view(b, nc, chunk_size, s)
     C = C.view(b, nc, chunk_size, s)
     
-    dtA = dt.unsqueeze(-1) * A.view(1, 1, 1, h, s)
-    cumA = torch.cumsum(dtA, dim=2)
-    
-    diff = cumA.unsqueeze(3) - cumA.unsqueeze(2)
-    L = torch.exp(torch.clamp(diff, max=0)).tril()
-    
-    dBu = dt.unsqueeze(-1) * B.unsqueeze(3) * u.unsqueeze(-1)
-    h_chunk = torch.einsum('bcijhs,bcjhs->bcihs', L, dBu)
+    causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=u.device))
     
     h_start = torch.zeros(b, h, s, device=u.device, dtype=u.dtype)
     y_out = torch.zeros(b, nc, chunk_size, h, device=u.device, dtype=u.dtype)
     
     for c in range(nc):
-        h_c = h_chunk[:, c] + torch.exp(torch.clamp(cumA[:, c], max=0)) * h_start.unsqueeze(1)
-        y_out[:, c] = (h_c * C[:, c].unsqueeze(2)).sum(-1)
+        u_c = u[:, c]
+        dt_c = dt[:, c]
+        B_c = B[:, c]
+        C_c = C[:, c]
+        
+        dtA = dt_c.unsqueeze(-1) * A.view(1, 1, h, s)
+        cumA = torch.cumsum(dtA, dim=1)
+        
+        diff = cumA.unsqueeze(2) - cumA.unsqueeze(1)
+        L = torch.exp(torch.clamp(diff, max=0)) * causal_mask.view(1, chunk_size, chunk_size, 1, 1)
+        
+        dBu = dt_c.unsqueeze(-1) * B_c.unsqueeze(2) * u_c.unsqueeze(-1)
+        h_chunk = torch.einsum('bqkhs,bkhs->bqhs', L, dBu)
+        
+        h_c = h_chunk + torch.exp(torch.clamp(cumA, max=0)) * h_start.unsqueeze(1)
+        y_out[:, c] = (h_c * C_c.unsqueeze(2)).sum(-1)
         h_start = h_c[:, -1]
         
     return y_out.view(b, n_p, h)[:, :n]
 
 
-def sliding_window_attention(q, k, v, window):
+def sliding_window_attention(q, k, v, window, attention_mask=None):
     b, h, n, d = q.shape
     out = torch.zeros_like(q)
 
@@ -59,6 +66,10 @@ def sliding_window_attention(q, k, v, window):
         q_idx = torch.arange(start, end, device=q.device).unsqueeze(1)
         k_idx = torch.arange(k_start, end, device=q.device).unsqueeze(0)
         mask = (k_idx <= q_idx) & (k_idx > q_idx - window)
+        
+        if attention_mask is not None:
+            mask_k = attention_mask[:, k_start:end].unsqueeze(1).unsqueeze(2)
+            mask = mask & mask_k
 
         scores = scores.masked_fill(~mask, float('-inf'))
         attn = F.softmax(scores, dim=-1)
@@ -96,7 +107,7 @@ class Mamba2Block(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-    def forward(self, u):
+    def forward(self, u, attention_mask=None):
         b, n, _ = u.shape
 
         xzBCdt = self.in_proj(u)
@@ -110,6 +121,10 @@ class Mamba2Block(nn.Module):
         x = F.silu(x)
 
         dt = F.softplus(self.dt_proj(dt_raw) + self.dt_bias)
+        
+        if attention_mask is not None:
+            dt = dt * attention_mask.unsqueeze(-1).float()
+            
         A = -torch.exp(self.A_log)
 
         y = ssd_forward(x, dt, A, B, C)
@@ -178,7 +193,7 @@ class HyperLoRAGenerator(nn.Module):
 
 
 class HALOLayer(nn.Module):
-    def __init__(self, d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank):
+    def __init__(self, d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, k_cand=128):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -186,6 +201,7 @@ class HALOLayer(nn.Module):
         self.window = window
         self.topk = topk
         self.n_sinks = n_sinks
+        self.k_cand = k_cand
 
         self.mamba = Mamba2Block(d_model, d_state, expand=expand)
         self.norm1 = nn.LayerNorm(d_model)
@@ -213,11 +229,11 @@ class HALOLayer(nn.Module):
         self.gate = nn.Linear(d_model, d_model, bias=False)
         self.ffn = SwiGLU(d_model, d_model * 2)
 
-    def forward(self, x, halora):
+    def forward(self, x, halora, attention_mask=None):
         b, n, d = x.shape
 
         x_norm = self.norm1(x)
-        H, dt = self.mamba(x_norm)
+        H, dt = self.mamba(x_norm, attention_mask)
         x = x + H
 
         x_norm = self.norm2(x)
@@ -238,13 +254,17 @@ class HALOLayer(nn.Module):
         k = k_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
         v = v_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
 
-        A_local = sliding_window_attention(q, k, v, self.window)
+        A_local = sliding_window_attention(q, k, v, self.window, attention_mask)
 
         imp = torch.sigmoid(self.imp_proj(H) + self.imp_lambda * dt.mean(-1, keepdim=True)).squeeze(-1)
         
+        if attention_mask is not None:
+            imp = imp.masked_fill(~attention_mask, -1e9)
+            
         chunk_size = 512
         idx_list = []
         valid_mask_list = []
+        
         for i in range(0, n, chunk_size):
             end = min(i + chunk_size, n)
             q_idx = torch.arange(i, end, device=x.device).unsqueeze(1)
@@ -254,19 +274,40 @@ class HALOLayer(nn.Module):
             imp_past = imp[:, :end].unsqueeze(1).expand(b, end - i, end)
             imp_masked = imp_past.masked_fill(~mask, -1e9)
             
-            tk = min(self.topk, end)
-            _, chunk_idx = torch.topk(imp_masked, tk, dim=-1)
+            ck = min(self.k_cand, end)
+            _, cand_idx = torch.topk(imp_masked, ck, dim=-1)
             
-            selected_valid = chunk_idx <= q_idx.unsqueeze(0)
-            valid_mask_list.append(selected_valid)
+            if ck < self.k_cand:
+                pad_c = torch.zeros(b, end - i, self.k_cand - ck, dtype=torch.long, device=x.device)
+                cand_idx = torch.cat([cand_idx, pad_c], dim=-1)
+                
+            cand_idx_exp = cand_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, end - i, self.k_cand, self.head_dim)
+            k_cand_exp = k[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
+            v_cand_exp = v[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
+            
+            k_cand = torch.gather(k_cand_exp, 3, cand_idx_exp)
+            v_cand = torch.gather(v_cand_exp, 3, cand_idx_exp)
+            
+            q_chunk = q[:, :, i:end]
+            scores_cand = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, k_cand) / math.sqrt(self.head_dim)
+            
+            cand_valid = cand_idx <= q_idx.unsqueeze(0)
+            scores_cand = scores_cand.masked_fill(~cand_valid.unsqueeze(1), -1e9)
+            
+            tk = min(self.topk, ck)
+            _, top_idx = torch.topk(scores_cand, tk, dim=-1)
+            
+            idx_final = torch.gather(cand_idx, 2, top_idx)
+            valid_final = torch.gather(cand_valid, 2, top_idx)
             
             if tk < self.topk:
                 pad_idx = torch.zeros(b, end - i, self.topk - tk, dtype=torch.long, device=x.device)
-                chunk_idx = torch.cat([chunk_idx, pad_idx], dim=-1)
+                idx_final = torch.cat([idx_final, pad_idx], dim=-1)
                 pad_valid = torch.zeros(b, end - i, self.topk - tk, dtype=torch.bool, device=x.device)
-                selected_valid = torch.cat([selected_valid, pad_valid], dim=-1)
+                valid_final = torch.cat([valid_final, pad_valid], dim=-1)
                 
-            idx_list.append(chunk_idx)
+            idx_list.append(idx_final)
+            valid_mask_list.append(valid_final)
             
         idx = torch.cat(idx_list, dim=1)
         valid_mask = torch.cat(valid_mask_list, dim=1)
@@ -335,7 +376,7 @@ class HALOLayer(nn.Module):
 
 class HALOModel(nn.Module):
     def __init__(self, vocab_size, d_model, n_layers, n_heads, window=256, topk=32,
-                 n_sinks=8, d_state=128, expand=2, lora_rank=4, group_size=4):
+                 n_sinks=8, d_state=128, expand=2, lora_rank=4, group_size=4, k_cand=128):
         super().__init__()
         assert n_layers % group_size == 0
         self.d_model = d_model
@@ -346,7 +387,7 @@ class HALOModel(nn.Module):
         self.embed = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList([
-            HALOLayer(d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank)
+            HALOLayer(d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, k_cand)
             for _ in range(n_layers)
         ])
 
@@ -356,7 +397,7 @@ class HALOModel(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, attention_mask=None):
         x = self.embed(input_ids)
         
         g = self.pool_norm(x[:, 0])
@@ -365,7 +406,7 @@ class HALOModel(nn.Module):
             halora = self.hyperlora(g, block_idx)
             for layer_in_block in range(self.group_size):
                 layer_idx = block_idx * self.group_size + layer_in_block
-                x = self.layers[layer_idx](x, halora)
+                x = self.layers[layer_idx](x, halora, attention_mask)
 
         x = self.final_norm(x)
         return self.lm_head(x)
