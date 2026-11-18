@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 
-def ssd_forward(u, dt, A, B, C, chunk_size=64):
+def ssd_forward(u, dt, A, B, C, chunk_size=16):
     b, n, h = u.shape
     s = B.shape[-1]
     
@@ -25,18 +25,17 @@ def ssd_forward(u, dt, A, B, C, chunk_size=64):
     dtA = dt.unsqueeze(-1) * A.view(1, 1, 1, h, s)
     cumA = torch.cumsum(dtA, dim=2)
     
-    L = torch.exp(cumA.unsqueeze(3) - cumA.unsqueeze(2))
-    L = torch.tril(L, diagonal=0)
+    diff = cumA.unsqueeze(3) - cumA.unsqueeze(2)
+    L = torch.exp(torch.clamp(diff, max=0)).tril()
     
     dBu = dt.unsqueeze(-1) * B.unsqueeze(3) * u.unsqueeze(-1)
-    
     h_chunk = torch.einsum('bcijhs,bcjhs->bcihs', L, dBu)
     
     h_start = torch.zeros(b, h, s, device=u.device, dtype=u.dtype)
     y_out = torch.zeros(b, nc, chunk_size, h, device=u.device, dtype=u.dtype)
     
     for c in range(nc):
-        h_c = h_chunk[:, c] + torch.exp(cumA[:, c]) * h_start.unsqueeze(1)
+        h_c = h_chunk[:, c] + torch.exp(torch.clamp(cumA[:, c], max=0)) * h_start.unsqueeze(1)
         y_out[:, c] = (h_c * C[:, c].unsqueeze(2)).sum(-1)
         h_start = h_c[:, -1]
         
@@ -248,20 +247,13 @@ class HALOLayer(nn.Module):
             _, chunk_idx = torch.topk(imp_masked, tk, dim=-1)
             
             if tk < self.topk:
-                pad_idx = torch.zeros(b, end - i, self.topk - tk, dtype=torch.long, device=x.device)
+                pad_idx = chunk_idx[:, :, -1:].expand(b, -1, self.topk - tk)
                 chunk_idx = torch.cat([chunk_idx, pad_idx], dim=-1)
                 
             idx_list.append(chunk_idx)
             
         idx = torch.cat(idx_list, dim=1)
         
-        idx_kv = idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, n, self.topk, self.head_dim)
-        k_exp = k.unsqueeze(3).expand(b, self.n_heads, n, self.topk, self.head_dim)
-        v_exp = v.unsqueeze(3).expand(b, self.n_heads, n, self.topk, self.head_dim)
-        
-        k_imp = torch.gather(k_exp, 2, idx_kv)
-        v_imp = torch.gather(v_exp, 2, idx_kv)
-
         sink_K = (self.sink_K.unsqueeze(0) + halora['dZ_K']).view(
             b, self.n_sinks, self.n_heads, self.head_dim
         ).permute(0, 2, 1, 3)
@@ -269,18 +261,36 @@ class HALOLayer(nn.Module):
             b, self.n_sinks, self.n_heads, self.head_dim
         ).permute(0, 2, 1, 3)
 
-        sink_K = sink_K.unsqueeze(2).expand(b, self.n_heads, n, self.n_sinks, self.head_dim)
-        sink_V = sink_V.unsqueeze(2).expand(b, self.n_heads, n, self.n_sinks, self.head_dim)
-
-        K_long = torch.cat([k_imp, sink_K], dim=3)
-        V_long = torch.cat([v_imp, sink_V], dim=3)
-
         q_corrected_flat = q_flat + self.qc_B(F.silu(self.qc_A(q_flat)))
         q_corrected = q_corrected_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_corrected, K_long) / math.sqrt(self.head_dim)
-        attn_long = F.softmax(scores_long, dim=-1)
-        A_long = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
+        A_long_list = []
+        for i in range(0, n, chunk_size):
+            end = min(i + chunk_size, n)
+            q_chunk = q_corrected[:, :, i:end]
+            idx_chunk = idx[:, i:end]
+            
+            idx_exp = idx_chunk.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, -1, self.topk, self.head_dim)
+            
+            k_chunk = k[:, :, :end].unsqueeze(3).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
+            v_chunk = v[:, :, :end].unsqueeze(3).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
+            
+            k_imp = torch.gather(k_chunk, 2, idx_exp)
+            v_imp = torch.gather(v_chunk, 2, idx_exp)
+            
+            sink_K_exp = sink_K.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
+            sink_V_exp = sink_V.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
+            
+            K_long = torch.cat([k_imp, sink_K_exp], dim=3)
+            V_long = torch.cat([v_imp, sink_V_exp], dim=3)
+            
+            scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, K_long) / math.sqrt(self.head_dim)
+            attn_long = F.softmax(scores_long, dim=-1)
+            A_long_chunk = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
+            
+            A_long_list.append(A_long_chunk)
+            
+        A_long = torch.cat(A_long_list, dim=2)
 
         A_local_flat = A_local.transpose(1, 2).reshape(b, n, d)
         A_long_flat = A_long.transpose(1, 2).reshape(b, n, d)
