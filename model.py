@@ -128,7 +128,8 @@ class HyperLoRAGenerator(nn.Module):
         self.rank = rank
         self.n_sinks = n_sinks
 
-        self.per_block_out = 6 * d_model * rank + 2 * n_sinks * d_model
+        self.head_A_size = 3 * d_model * rank
+        self.head_B_size = 3 * d_model * rank + 2 * n_sinks * d_model
 
         self.trunk = nn.Sequential(
             nn.Linear(d_model, hidden),
@@ -136,28 +137,37 @@ class HyperLoRAGenerator(nn.Module):
             nn.Linear(hidden, hidden),
         )
         self.block_emb = nn.Parameter(torch.zeros(n_blocks, hidden))
-        self.head = nn.Linear(hidden, self.per_block_out)
+        
+        self.head_A = nn.Linear(hidden, self.head_A_size)
+        self.head_B = nn.Linear(hidden, self.head_B_size)
 
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        nn.init.kaiming_uniform_(self.head_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.head_A.bias)
+        
+        nn.init.zeros_(self.head_B.weight)
+        nn.init.zeros_(self.head_B.bias)
 
     def forward(self, g, block_idx):
         b = g.shape[0]
         h = self.trunk(g) + self.block_emb[block_idx].unsqueeze(0)
-        out = self.head(h)
+        
+        out_A = self.head_A(h)
+        out_B = self.head_B(h)
 
         d = self.d_model
         r = self.rank
         ns = self.n_sinks
 
-        A_K = out[:, :d * r].view(b, r, d)
-        B_K = out[:, d * r:2 * d * r].view(b, d, r)
-        A_V = out[:, 2 * d * r:3 * d * r].view(b, r, d)
-        B_V = out[:, 3 * d * r:4 * d * r].view(b, d, r)
-        A_O = out[:, 4 * d * r:5 * d * r].view(b, r, d)
-        B_O = out[:, 5 * d * r:6 * d * r].view(b, d, r)
-        dZ_K = out[:, 6 * d * r:6 * d * r + ns * d].view(b, ns, d)
-        dZ_V = out[:, 6 * d * r + ns * d:].view(b, ns, d)
+        A_K = out_A[:, :d * r].view(b, r, d)
+        A_V = out_A[:, d * r:2 * d * r].view(b, r, d)
+        A_O = out_A[:, 2 * d * r:3 * d * r].view(b, r, d)
+
+        B_K = out_B[:, :d * r].view(b, d, r)
+        B_V = out_B[:, d * r:2 * d * r].view(b, d, r)
+        B_O = out_B[:, 2 * d * r:3 * d * r].view(b, d, r)
+        
+        dZ_K = out_B[:, 3 * d * r:3 * d * r + ns * d].view(b, ns, d)
+        dZ_V = out_B[:, 3 * d * r + ns * d:].view(b, ns, d)
 
         return {
             'A_K': A_K, 'B_K': B_K,
@@ -234,6 +244,7 @@ class HALOLayer(nn.Module):
         
         chunk_size = 512
         idx_list = []
+        valid_mask_list = []
         for i in range(0, n, chunk_size):
             end = min(i + chunk_size, n)
             q_idx = torch.arange(i, end, device=x.device).unsqueeze(1)
@@ -246,13 +257,19 @@ class HALOLayer(nn.Module):
             tk = min(self.topk, end)
             _, chunk_idx = torch.topk(imp_masked, tk, dim=-1)
             
+            selected_valid = chunk_idx <= q_idx.unsqueeze(0)
+            valid_mask_list.append(selected_valid)
+            
             if tk < self.topk:
-                pad_idx = chunk_idx[:, :, -1:].expand(b, -1, self.topk - tk)
+                pad_idx = torch.zeros(b, end - i, self.topk - tk, dtype=torch.long, device=x.device)
                 chunk_idx = torch.cat([chunk_idx, pad_idx], dim=-1)
+                pad_valid = torch.zeros(b, end - i, self.topk - tk, dtype=torch.bool, device=x.device)
+                selected_valid = torch.cat([selected_valid, pad_valid], dim=-1)
                 
             idx_list.append(chunk_idx)
             
         idx = torch.cat(idx_list, dim=1)
+        valid_mask = torch.cat(valid_mask_list, dim=1)
         
         sink_K = (self.sink_K.unsqueeze(0) + halora['dZ_K']).view(
             b, self.n_sinks, self.n_heads, self.head_dim
@@ -270,13 +287,13 @@ class HALOLayer(nn.Module):
             q_chunk = q_corrected[:, :, i:end]
             idx_chunk = idx[:, i:end]
             
-            idx_exp = idx_chunk.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, -1, self.topk, self.head_dim)
+            idx_exp = idx_chunk.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
             
-            k_chunk = k[:, :, :end].unsqueeze(3).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
-            v_chunk = v[:, :, :end].unsqueeze(3).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
+            k_chunk = k[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
+            v_chunk = v[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
             
-            k_imp = torch.gather(k_chunk, 2, idx_exp)
-            v_imp = torch.gather(v_chunk, 2, idx_exp)
+            k_imp = torch.gather(k_chunk, 3, idx_exp)
+            v_imp = torch.gather(v_chunk, 3, idx_exp)
             
             sink_K_exp = sink_K.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
             sink_V_exp = sink_V.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
@@ -285,6 +302,13 @@ class HALOLayer(nn.Module):
             V_long = torch.cat([v_imp, sink_V_exp], dim=3)
             
             scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, K_long) / math.sqrt(self.head_dim)
+            
+            mask_long = torch.cat([
+                valid_mask[:, i:end].unsqueeze(1).expand(b, self.n_heads, end - i, self.topk),
+                torch.ones(b, self.n_heads, end - i, self.n_sinks, dtype=torch.bool, device=x.device)
+            ], dim=-1)
+            
+            scores_long = scores_long.masked_fill(~mask_long, float('-inf'))
             attn_long = F.softmax(scores_long, dim=-1)
             A_long_chunk = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
             
