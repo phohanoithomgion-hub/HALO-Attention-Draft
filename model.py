@@ -151,6 +151,9 @@ class MultiScalePooler(nn.Module):
         imp = self.score_proj(x).squeeze(-1)
         if mask is not None:
             imp = imp.masked_fill(~mask, -1e9)
+            valid_n = mask.sum(dim=1, keepdim=True)
+        else:
+            valid_n = torch.full((b, 1), n, device=x.device)
             
         _, idx = torch.sort(imp, dim=-1, descending=True)
         
@@ -168,6 +171,9 @@ class MultiScalePooler(nn.Module):
                 p = x_top.sum(dim=1) / denom
             else:
                 p = x_top.mean(dim=1)
+                
+            scale_valid = (valid_n >= s).float()
+            p = p * scale_valid
             pooled.append(p)
             
         return self.mlp(torch.cat(pooled, dim=-1))
@@ -317,78 +323,78 @@ class HALOLayer(nn.Module):
             sink_V = (self.sink_V.unsqueeze(0) + h_c['dZ_V']).view(b, self.n_sinks, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
 
             if start == 0:
-                K_long = sink_K.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
-                V_long = sink_V.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
-            else:
-                n_blk = start // self.block_size
-                imp_past = imp[:, :start].view(b, n_blk, self.block_size)
-                
-                mask_past = None
-                if attention_mask is not None:
-                    mask_past = attention_mask[:, :start].view(b, n_blk, self.block_size)
-                    imp_past = imp_past.masked_fill(~mask_past, -1e9)
-                    
-                blk_max = imp_past.max(dim=-1)[0]
-                
-                if mask_past is not None:
-                    blk_sum = imp_past.masked_fill(~mask_past, 0).sum(dim=-1)
-                    blk_count = mask_past.sum(dim=-1).clamp(min=1)
-                    blk_mean = blk_sum / blk_count
-                else:
-                    blk_mean = imp_past.mean(dim=-1)
-                    
-                nb = min(8, n_blk)
-                _, top_max = torch.topk(blk_max, nb, dim=-1)
-                _, top_mean = torch.topk(blk_mean, nb, dim=-1)
-                
-                sel_mask = torch.zeros(b, n_blk, device=x.device, dtype=torch.bool)
-                sel_mask.scatter_(1, top_max, True)
-                sel_mask.scatter_(1, top_mean, True)
-                
-                sel_score = sel_mask.float() * blk_max + (~sel_mask).float() * -1e9
-                n_sel = min(16, n_blk)
-                sel_val, sel_idx = torch.topk(sel_score, n_sel, dim=-1)
-                
-                if n_sel < 16:
-                    pad_idx = torch.zeros(b, 16 - n_sel, dtype=torch.long, device=x.device)
-                    sel_idx = torch.cat([sel_idx, pad_idx], dim=-1)
-                    pad_val = torch.full((b, 16 - n_sel), -1e9, device=x.device)
-                    sel_val = torch.cat([sel_val, pad_val], dim=-1)
-                    
-                tok_idx = sel_idx.unsqueeze(-1) * self.block_size + torch.arange(self.block_size, device=x.device)
-                tok_idx = tok_idx.view(b, -1)
-                
-                valid_tok = (sel_val.unsqueeze(-1) > -1e8) & (tok_idx < start)
-                if attention_mask is not None:
-                    m_tok = torch.gather(attention_mask, 1, tok_idx.clamp(max=n-1))
-                    valid_tok = valid_tok & m_tok
-                    
-                idx_exp = tok_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, -1, self.head_dim)
-                k_sel = torch.gather(k, 2, idx_exp)
-                v_sel = torch.gather(v, 2, idx_exp)
-                
-                sink_K_exp = sink_K.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
-                sink_V_exp = sink_V.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
-                
-                K_long = torch.cat([k_sel, sink_K_exp], dim=2)
-                V_long = torch.cat([v_sel, sink_V_exp], dim=2)
-                
-                mask_long = torch.cat([
-                    valid_tok.unsqueeze(1).expand(b, self.n_heads, -1),
-                    torch.ones(b, self.n_heads, self.n_sinks, dtype=torch.bool, device=x.device)
-                ], dim=-1)
+                K_long = sink_K
+                V_long = sink_V
                 
                 scores_long = torch.einsum('bhqd,bhkd->bhqk', q_chunk, K_long) / math.sqrt(self.head_dim)
-                scores_long = scores_long.masked_fill(~mask_long.unsqueeze(2), -1e9)
-                
                 attn_long = F.softmax(scores_long, dim=-1)
-                attn_long = torch.nan_to_num(attn_long, nan=0.0)
                 A_long_chunk = torch.einsum('bhqk,bhkd->bhqd', attn_long, V_long)
                 A_long_list.append(A_long_chunk)
                 continue
-
+                
+            n_blk = start // self.block_size
+            imp_past = imp[:, :start].view(b, n_blk, self.block_size)
+            
+            mask_past = None
+            if attention_mask is not None:
+                mask_past = attention_mask[:, :start].view(b, n_blk, self.block_size)
+                imp_past = imp_past.masked_fill(~mask_past, -1e9)
+                
+            blk_max = imp_past.max(dim=-1)[0]
+            
+            if mask_past is not None:
+                blk_sum = imp_past.masked_fill(~mask_past, 0).sum(dim=-1)
+                blk_count = mask_past.sum(dim=-1).clamp(min=1)
+                blk_mean = blk_sum / blk_count
+            else:
+                blk_mean = imp_past.mean(dim=-1)
+                
+            nb = min(8, n_blk)
+            _, top_max = torch.topk(blk_max, nb, dim=-1)
+            _, top_mean = torch.topk(blk_mean, nb, dim=-1)
+            
+            sel_mask = torch.zeros(b, n_blk, device=x.device, dtype=torch.bool)
+            sel_mask.scatter_(1, top_max, True)
+            sel_mask.scatter_(1, top_mean, True)
+            
+            sel_score = sel_mask.float() * blk_max + (~sel_mask).float() * -1e9
+            n_sel = min(16, n_blk)
+            sel_val, sel_idx = torch.topk(sel_score, n_sel, dim=-1)
+            
+            if n_sel < 16:
+                pad_idx = torch.zeros(b, 16 - n_sel, dtype=torch.long, device=x.device)
+                sel_idx = torch.cat([sel_idx, pad_idx], dim=-1)
+                pad_val = torch.full((b, 16 - n_sel), -1e9, device=x.device)
+                sel_val = torch.cat([sel_val, pad_val], dim=-1)
+                
+            tok_idx = sel_idx.unsqueeze(-1) * self.block_size + torch.arange(self.block_size, device=x.device)
+            tok_idx = tok_idx.view(b, -1)
+            
+            valid_block = sel_val > -1e8
+            valid_tok = valid_block.unsqueeze(-1).expand(-1, -1, self.block_size).reshape(b, -1)
+            valid_tok = valid_tok & (tok_idx < start)
+            
+            if attention_mask is not None:
+                m_tok = torch.gather(attention_mask, 1, tok_idx.clamp(max=n-1))
+                valid_tok = valid_tok & m_tok
+                
+            idx_exp = tok_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, -1, self.head_dim)
+            k_sel = torch.gather(k, 2, idx_exp)
+            v_sel = torch.gather(v, 2, idx_exp)
+            
+            K_long = torch.cat([k_sel, sink_K], dim=2)
+            V_long = torch.cat([v_sel, sink_V], dim=2)
+            
+            mask_long = torch.cat([
+                valid_tok.unsqueeze(1).expand(b, self.n_heads, -1),
+                torch.ones(b, self.n_heads, self.n_sinks, dtype=torch.bool, device=x.device)
+            ], dim=-1)
+            
             scores_long = torch.einsum('bhqd,bhkd->bhqk', q_chunk, K_long) / math.sqrt(self.head_dim)
+            scores_long = scores_long.masked_fill(~mask_long.unsqueeze(2), -1e9)
+            
             attn_long = F.softmax(scores_long, dim=-1)
+            attn_long = torch.nan_to_num(attn_long, nan=0.0)
             A_long_chunk = torch.einsum('bhqk,bhkd->bhqd', attn_long, V_long)
             A_long_list.append(A_long_chunk)
             
