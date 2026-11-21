@@ -71,9 +71,13 @@ def sliding_window_attention(q, k, v, window, attention_mask=None):
             mask_k = attention_mask[:, k_start:end].unsqueeze(1).unsqueeze(2)
             mask = mask & mask_k
 
+        has_key = mask.any(dim=-1, keepdim=True)
         scores = scores.masked_fill(~mask, float('-inf'))
+        scores = torch.where(has_key, scores, torch.zeros_like(scores))
+        
         attn = F.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)
+        attn = attn.masked_fill(~mask, 0.0)
+        
         out[:, :, start:end] = torch.einsum('bhij,bhjd->bhid', attn, v_blk)
 
     return out
@@ -118,6 +122,9 @@ class Mamba2Block(nn.Module):
             dim=-1,
         )
 
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).float()
+
         x = self.conv1d(x.transpose(1, 2))[:, :, :n].transpose(1, 2)
         x = F.silu(x)
 
@@ -155,6 +162,7 @@ class MultiScalePooler(nn.Module):
         else:
             valid_n = torch.full((b, 1), n, device=x.device)
             
+        imp_soft = torch.softmax(imp, dim=-1)
         _, idx = torch.sort(imp, dim=-1, descending=True)
         
         sizes = [256, 128, 64, 32, 16, 8, 4]
@@ -163,14 +171,15 @@ class MultiScalePooler(nn.Module):
             k = min(s, n)
             top_idx = idx[:, :k]
             x_top = torch.gather(x, 1, top_idx.unsqueeze(-1).expand(-1, -1, d))
+            w_top = torch.gather(imp_soft, 1, top_idx).unsqueeze(-1)
             
             if mask is not None:
                 m_top = torch.gather(mask, 1, top_idx).unsqueeze(-1)
                 x_top = x_top * m_top
                 denom = m_top.sum(dim=1).clamp(min=1)
-                p = x_top.sum(dim=1) / denom
+                p = (x_top * w_top).sum(dim=1) / denom
             else:
-                p = x_top.mean(dim=1)
+                p = (x_top * w_top).sum(dim=1)
                 
             scale_valid = (valid_n >= s).float()
             p = p * scale_valid
@@ -382,6 +391,10 @@ class HALOLayer(nn.Module):
             k_sel = torch.gather(k, 2, idx_exp)
             v_sel = torch.gather(v, 2, idx_exp)
             
+            sel_w = torch.sigmoid(torch.gather(blk_max, 1, sel_idx))
+            sel_w = sel_w.unsqueeze(1).unsqueeze(-1)
+            k_sel = k_sel * sel_w
+            
             K_long = torch.cat([k_sel, sink_K], dim=2)
             V_long = torch.cat([v_sel, sink_V], dim=2)
             
@@ -406,13 +419,17 @@ class HALOLayer(nn.Module):
         gate = torch.sigmoid(self.gate(x_norm))
         A_flat = gate * A_local_flat + (1 - gate) * A_long_flat
 
+        delta_o_list = []
         for c in range(n_chunks):
             start = c * self.chunk_size
             end = min((c+1) * self.chunk_size, n)
             h_c = halora_list[c]
             A_c = A_flat[:, start:end]
             delta_o = torch.einsum('bnr,bdr->bnd', torch.einsum('bnd,brd->bnr', A_c, h_c['A_O']), h_c['B_O']) * self.scale_O
-            A_flat[:, start:end] = A_flat[:, start:end] + delta_o
+            delta_o_list.append(delta_o)
+            
+        delta_o = torch.cat(delta_o_list, dim=1)
+        A_flat = A_flat + delta_o
 
         A_out = self.o_proj(A_flat)
         x = x + A_out
@@ -456,7 +473,11 @@ class HALOModel(nn.Module):
             for c in range(n_chunks):
                 start = c * self.chunk_size
                 if start == 0:
-                    g_c = self.pool_norm(x[:, 0])
+                    if attention_mask is not None:
+                        first_valid_idx = attention_mask.float().argmax(dim=1)
+                        g_c = self.pool_norm(x[torch.arange(b, device=x.device), first_valid_idx])
+                    else:
+                        g_c = self.pool_norm(x[:, 0])
                 else:
                     past_end = start
                     past_start = max(0, past_end - 256)
