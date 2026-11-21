@@ -22,9 +22,7 @@ def ssd_forward(u, dt, A, B, C, chunk_size=16):
     B = B.view(b, nc, chunk_size, s)
     C = C.view(b, nc, chunk_size, s)
     
-    causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=u.device))
-    
-    h_start = torch.zeros(b, h, s, device=u.device, dtype=u.dtype)
+    h_state = torch.zeros(b, h, s, device=u.device, dtype=u.dtype)
     y_out = torch.zeros(b, nc, chunk_size, h, device=u.device, dtype=u.dtype)
     
     for c in range(nc):
@@ -33,18 +31,15 @@ def ssd_forward(u, dt, A, B, C, chunk_size=16):
         B_c = B[:, c]
         C_c = C[:, c]
         
-        dtA = dt_c.unsqueeze(-1) * A.view(1, 1, h, s)
-        cumA = torch.cumsum(dtA, dim=1)
-        
-        diff = cumA.unsqueeze(2) - cumA.unsqueeze(1)
-        L = torch.exp(torch.clamp(diff, max=0)) * causal_mask.view(1, chunk_size, chunk_size, 1, 1)
-        
+        dA = torch.exp(dt_c.unsqueeze(-1) * A)
         dBu = dt_c.unsqueeze(-1) * B_c.unsqueeze(2) * u_c.unsqueeze(-1)
-        h_chunk = torch.einsum('bqkhs,bkhs->bqhs', L, dBu)
         
-        h_c = h_chunk + torch.exp(torch.clamp(cumA, max=0)) * h_start.unsqueeze(1)
-        y_out[:, c] = (h_c * C_c.unsqueeze(2)).sum(-1)
-        h_start = h_c[:, -1]
+        y_c = []
+        for i in range(chunk_size):
+            h_state = dA[:, i] * h_state + dBu[:, i]
+            y_c.append((h_state * C_c[:, i].unsqueeze(1)).sum(-1))
+            
+        y_out[:, c] = torch.stack(y_c, dim=1)
         
     return y_out.view(b, n_p, h)[:, :n]
 
@@ -175,11 +170,10 @@ class MultiScalePooler(nn.Module):
             
             if mask is not None:
                 m_top = torch.gather(mask, 1, top_idx).unsqueeze(-1)
-                x_top = x_top * m_top
-                denom = m_top.sum(dim=1).clamp(min=1)
-                p = (x_top * w_top).sum(dim=1) / denom
-            else:
-                p = (x_top * w_top).sum(dim=1)
+                w_top = w_top * m_top.float()
+                
+            denom = w_top.sum(dim=1).clamp(min=1e-8)
+            p = (x_top * w_top).sum(dim=1) / denom
                 
             scale_valid = (valid_n >= s).float()
             p = p * scale_valid
@@ -305,8 +299,8 @@ class HALOLayer(nn.Module):
             delta_k = torch.einsum('bnr,bdr->bnd', torch.einsum('bnd,brd->bnr', x_c, h_c['A_K']), h_c['B_K']) * self.scale_K
             delta_v = torch.einsum('bnr,bdr->bnd', torch.einsum('bnd,brd->bnr', x_c, h_c['A_V']), h_c['B_V']) * self.scale_V
             
-            k_flat[:, start:end] = k_flat[:, start:end] + delta_k
-            v_flat[:, start:end] = v_flat[:, start:end] + delta_v
+            k_flat = torch.cat([k_flat[:, :start], k_flat[:, start:end] + delta_k, k_flat[:, end:]], dim=1)
+            v_flat = torch.cat([v_flat[:, :start], v_flat[:, start:end] + delta_v, v_flat[:, end:]], dim=1)
 
         q = q_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
         k = k_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
@@ -353,8 +347,9 @@ class HALOLayer(nn.Module):
             
             if mask_past is not None:
                 blk_sum = imp_past.masked_fill(~mask_past, 0).sum(dim=-1)
-                blk_count = mask_past.sum(dim=-1).clamp(min=1)
-                blk_mean = blk_sum / blk_count
+                blk_count = mask_past.sum(dim=-1)
+                blk_mean = blk_sum / blk_count.clamp(min=1)
+                blk_mean = blk_mean.masked_fill(blk_count == 0, -1e9)
             else:
                 blk_mean = imp_past.mean(dim=-1)
                 
@@ -391,9 +386,9 @@ class HALOLayer(nn.Module):
             k_sel = torch.gather(k, 2, idx_exp)
             v_sel = torch.gather(v, 2, idx_exp)
             
-            sel_w = torch.sigmoid(torch.gather(blk_max, 1, sel_idx))
-            sel_w = sel_w.unsqueeze(1).unsqueeze(-1)
-            k_sel = k_sel * sel_w
+            w_tok = torch.gather(imp, 1, tok_idx.clamp(max=n-1))
+            w_tok = w_tok * valid_tok.float()
+            bias = torch.log(w_tok + 1e-9).unsqueeze(1).unsqueeze(2)
             
             K_long = torch.cat([k_sel, sink_K], dim=2)
             V_long = torch.cat([v_sel, sink_V], dim=2)
@@ -404,10 +399,20 @@ class HALOLayer(nn.Module):
             ], dim=-1)
             
             scores_long = torch.einsum('bhqd,bhkd->bhqk', q_chunk, K_long) / math.sqrt(self.head_dim)
+            
+            bias_padded = torch.cat([
+                bias, 
+                torch.zeros(b, 1, 1, self.n_sinks, device=x.device)
+            ], dim=-1)
+            
+            scores_long = scores_long + bias_padded
+            
+            has_key_long = mask_long.any(dim=-1, keepdim=True).unsqueeze(2)
             scores_long = scores_long.masked_fill(~mask_long.unsqueeze(2), -1e9)
+            scores_long = torch.where(has_key_long, scores_long, torch.zeros_like(scores_long))
             
             attn_long = F.softmax(scores_long, dim=-1)
-            attn_long = torch.nan_to_num(attn_long, nan=0.0)
+            attn_long = attn_long.masked_fill(~mask_long.unsqueeze(2), 0.0)
             A_long_chunk = torch.einsum('bhqk,bhkd->bhqd', attn_long, V_long)
             A_long_list.append(A_long_chunk)
             
