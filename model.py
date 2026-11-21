@@ -136,6 +136,42 @@ class Mamba2Block(nn.Module):
         return out, dt
 
 
+class MultiScalePooler(nn.Module):
+    def __init__(self, d_model, out_dim):
+        super().__init__()
+        self.score_proj = nn.Linear(d_model, 1, bias=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model * 7, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim)
+        )
+
+    def forward(self, x, mask):
+        b, n, d = x.shape
+        imp = self.score_proj(x).squeeze(-1)
+        if mask is not None:
+            imp = imp.masked_fill(~mask, -1e9)
+            
+        _, idx = torch.sort(imp, dim=-1, descending=True)
+        
+        sizes = [256, 128, 64, 32, 16, 8, 4]
+        pooled = []
+        for s in sizes:
+            k = min(s, n)
+            top_idx = idx[:, :k]
+            x_top = torch.gather(x, 1, top_idx.unsqueeze(-1).expand(-1, -1, d))
+            if mask is not None:
+                m_top = torch.gather(mask, 1, top_idx).unsqueeze(-1)
+                x_top = x_top * m_top
+                denom = m_top.sum(dim=1).clamp(min=1)
+                p = x_top.sum(dim=1) / denom
+            else:
+                p = x_top.mean(dim=1)
+            pooled.append(p)
+            
+        return self.mlp(torch.cat(pooled, dim=-1))
+
+
 class HyperLoRAGenerator(nn.Module):
     def __init__(self, d_model, n_blocks, rank=4, n_sinks=8, hidden=128):
         super().__init__()
@@ -194,7 +230,7 @@ class HyperLoRAGenerator(nn.Module):
 
 
 class HALOLayer(nn.Module):
-    def __init__(self, d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, k_cand=128, chunk_size=512):
+    def __init__(self, d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, chunk_size=128, block_size=64, n_blocks_sel=4):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -202,8 +238,9 @@ class HALOLayer(nn.Module):
         self.window = window
         self.topk = topk
         self.n_sinks = n_sinks
-        self.k_cand = k_cand
         self.chunk_size = chunk_size
+        self.block_size = block_size
+        self.n_blocks_sel = n_blocks_sel
 
         self.mamba = Mamba2Block(d_model, d_state, expand=expand)
         self.norm1 = nn.LayerNorm(d_model)
@@ -264,103 +301,100 @@ class HALOLayer(nn.Module):
         A_local = sliding_window_attention(q, k, v, self.window, attention_mask)
 
         imp = torch.sigmoid(self.imp_proj(H) + self.imp_lambda * dt.mean(-1, keepdim=True)).squeeze(-1)
-        
         if attention_mask is not None:
             imp = imp.masked_fill(~attention_mask, -1e9)
-            
-        idx_list = []
-        valid_mask_list = []
-        
-        for i in range(0, n, self.chunk_size):
-            end = min(i + self.chunk_size, n)
-            q_idx = torch.arange(i, end, device=x.device).unsqueeze(1)
-            k_idx = torch.arange(0, end, device=x.device).unsqueeze(0)
-            mask = q_idx >= k_idx
-            
-            imp_past = imp[:, :end].unsqueeze(1).expand(b, end - i, end)
-            imp_masked = imp_past.masked_fill(~mask, -1e9)
-            
-            ck = min(self.k_cand, end)
-            _, cand_idx = torch.topk(imp_masked, ck, dim=-1)
-            
-            if ck < self.k_cand:
-                pad_c = torch.full((b, end - i, self.k_cand - ck), -1, dtype=torch.long, device=x.device)
-                cand_idx = torch.cat([cand_idx, pad_c], dim=-1)
-                
-            cand_idx_exp = cand_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, end - i, self.k_cand, self.head_dim)
-            k_cand_exp = k[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
-            v_cand_exp = v[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
-            
-            k_cand = torch.gather(k_cand_exp, 3, cand_idx_exp)
-            v_cand = torch.gather(v_cand_exp, 3, cand_idx_exp)
-            
-            q_chunk = q[:, :, i:end]
-            scores_cand = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, k_cand) / math.sqrt(self.head_dim)
-            
-            cand_valid = (cand_idx >= 0) & (cand_idx <= q_idx.unsqueeze(0))
-            scores_cand = scores_cand.masked_fill(~cand_valid.unsqueeze(1), -1e9)
-            
-            scores_shared = scores_cand.mean(dim=1)
-            tk = min(self.topk, ck)
-            _, top_idx = torch.topk(scores_shared, tk, dim=-1)
-            
-            idx_final = torch.gather(cand_idx, 2, top_idx)
-            valid_final = torch.gather(cand_valid, 2, top_idx)
-            
-            if tk < self.topk:
-                pad_idx = torch.full((b, end - i, self.topk - tk), -1, dtype=torch.long, device=x.device)
-                idx_final = torch.cat([idx_final, pad_idx], dim=-1)
-                pad_valid = torch.zeros(b, end - i, self.topk - tk, dtype=torch.bool, device=x.device)
-                valid_final = torch.cat([valid_final, pad_valid], dim=-1)
-                
-            idx_list.append(idx_final)
-            valid_mask_list.append(valid_final)
-            
-        idx = torch.cat(idx_list, dim=1)
-        valid_mask = torch.cat(valid_mask_list, dim=1)
-        
-        sink_K = (self.sink_K.unsqueeze(0) + halora_list[0]['dZ_K']).view(
-            b, self.n_sinks, self.n_heads, self.head_dim
-        ).permute(0, 2, 1, 3)
-        sink_V = (self.sink_V.unsqueeze(0) + halora_list[0]['dZ_V']).view(
-            b, self.n_sinks, self.n_heads, self.head_dim
-        ).permute(0, 2, 1, 3)
 
         q_corrected_flat = q_flat + self.qc_B(F.silu(self.qc_A(q_flat)))
         q_corrected = q_corrected_flat.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
 
         A_long_list = []
-        for i in range(0, n, self.chunk_size):
-            end = min(i + self.chunk_size, n)
-            q_chunk = q_corrected[:, :, i:end]
-            idx_chunk = idx[:, i:end]
+        for c in range(n_chunks):
+            start = c * self.chunk_size
+            end = min((c+1) * self.chunk_size, n)
+            q_chunk = q_corrected[:, :, start:end]
+            h_c = halora_list[c]
             
-            idx_exp = idx_chunk.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, end - i, self.topk, self.head_dim)
-            
-            k_chunk = k[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
-            v_chunk = v[:, :, :end].unsqueeze(2).expand(b, self.n_heads, end - i, end, self.head_dim)
-            
-            k_imp = torch.gather(k_chunk, 3, idx_exp)
-            v_imp = torch.gather(v_chunk, 3, idx_exp)
-            
-            sink_K_exp = sink_K.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
-            sink_V_exp = sink_V.unsqueeze(2).expand(b, self.n_heads, end - i, self.n_sinks, self.head_dim)
-            
-            K_long = torch.cat([k_imp, sink_K_exp], dim=3)
-            V_long = torch.cat([v_imp, sink_V_exp], dim=3)
-            
+            sink_K = (self.sink_K.unsqueeze(0) + h_c['dZ_K']).view(b, self.n_sinks, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            sink_V = (self.sink_V.unsqueeze(0) + h_c['dZ_V']).view(b, self.n_sinks, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            if start == 0:
+                K_long = sink_K.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
+                V_long = sink_V.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
+            else:
+                n_blk = start // self.block_size
+                imp_past = imp[:, :start].view(b, n_blk, self.block_size)
+                
+                if attention_mask is not None:
+                    mask_past = attention_mask[:, :start].view(b, n_blk, self.block_size)
+                    imp_past = imp_past.masked_fill(~mask_past, -1e9)
+                    
+                blk_max = imp_past.max(dim=-1)[0]
+                blk_mean = imp_past.mean(dim=-1)
+                
+                nb = min(self.n_blocks_sel, n_blk)
+                _, top_max = torch.topk(blk_max, nb, dim=-1)
+                _, top_mean = torch.topk(blk_mean, nb, dim=-1)
+                
+                sel_blk = torch.cat([top_max, top_mean], dim=-1)
+                sel_blk, _ = torch.sort(sel_blk, dim=-1)
+                sel_blk = torch.unique_consecutive(sel_blk, dim=-1)
+                
+                blk_idx = sel_blk.unsqueeze(-1) * self.block_size + torch.arange(self.block_size, device=x.device)
+                blk_idx = blk_idx.view(b, -1)
+                
+                num_cand = blk_idx.shape[1]
+                idx_exp = blk_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, num_cand, self.head_dim)
+                
+                k_cand = torch.gather(k, 2, idx_exp)
+                v_cand = torch.gather(v, 2, idx_exp)
+                
+                scores_cand = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, k_cand) / math.sqrt(self.head_dim)
+                
+                valid_cand = torch.ones(b, num_cand, dtype=torch.bool, device=x.device)
+                if attention_mask is not None:
+                    valid_cand = torch.gather(attention_mask, 1, blk_idx)
+                    valid_cand = valid_cand.unsqueeze(1).expand(b, self.n_heads, num_cand)
+                    
+                scores_cand = scores_cand.masked_fill(~valid_cand.unsqueeze(2), -1e9)
+                
+                tk = min(self.topk, num_cand)
+                _, topk_idx = torch.topk(scores_cand.mean(dim=1), tk, dim=-1)
+                
+                final_idx = torch.gather(blk_idx, 1, topk_idx)
+                valid_final = torch.gather(valid_cand[:, 0], 1, topk_idx)
+                
+                if tk < self.topk:
+                    pad_idx = torch.zeros(b, self.topk - tk, dtype=torch.long, device=x.device)
+                    final_idx = torch.cat([final_idx, pad_idx], dim=-1)
+                    valid_final = torch.cat([valid_final, torch.zeros(b, self.topk - tk, dtype=torch.bool, device=x.device)], dim=-1)
+                    
+                idx_exp2 = final_idx.unsqueeze(1).unsqueeze(-1).expand(b, self.n_heads, self.topk, self.head_dim)
+                k_imp = torch.gather(k, 2, idx_exp2)
+                v_imp = torch.gather(v, 2, idx_exp2)
+                
+                sink_K_exp = sink_K.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
+                sink_V_exp = sink_V.expand(b, self.n_heads, end - start, self.n_sinks, self.head_dim)
+                
+                K_long = torch.cat([k_imp, sink_K_exp], dim=2)
+                V_long = torch.cat([v_imp, sink_V_exp], dim=2)
+                
+                mask_long = torch.cat([
+                    valid_final.unsqueeze(1).expand(b, self.n_heads, self.topk),
+                    torch.ones(b, self.n_heads, self.n_sinks, dtype=torch.bool, device=x.device)
+                ], dim=-1)
+                
+                scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, K_long) / math.sqrt(self.head_dim)
+                scores_long = scores_long.masked_fill(~mask_long.unsqueeze(2), -1e9)
+                
+                attn_long = F.softmax(scores_long, dim=-1)
+                attn_long = torch.nan_to_num(attn_long, nan=0.0)
+                A_long_chunk = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
+                A_long_list.append(A_long_chunk)
+                continue
+
             scores_long = torch.einsum('bhnd,bhnkd->bhnk', q_chunk, K_long) / math.sqrt(self.head_dim)
-            
-            mask_long = torch.cat([
-                valid_mask[:, i:end].unsqueeze(1).expand(b, self.n_heads, end - i, self.topk),
-                torch.ones(b, self.n_heads, end - i, self.n_sinks, dtype=torch.bool, device=x.device)
-            ], dim=-1)
-            
-            scores_long = scores_long.masked_fill(~mask_long, float('-inf'))
             attn_long = F.softmax(scores_long, dim=-1)
-            attn_long = torch.nan_to_num(attn_long, nan=0.0)
             A_long_chunk = torch.einsum('bhnk,bhnkd->bhnd', attn_long, V_long)
-            
             A_long_list.append(A_long_chunk)
             
         A_long = torch.cat(A_long_list, dim=2)
@@ -380,7 +414,6 @@ class HALOLayer(nn.Module):
             A_flat[:, start:end] = A_flat[:, start:end] + delta_o
 
         A_out = self.o_proj(A_flat)
-
         x = x + A_out
         x = x + self.ffn(self.norm3(x))
         return x
@@ -388,7 +421,7 @@ class HALOLayer(nn.Module):
 
 class HALOModel(nn.Module):
     def __init__(self, vocab_size, d_model, n_layers, n_heads, window=256, topk=32,
-                 n_sinks=8, d_state=128, expand=2, lora_rank=4, group_size=4, k_cand=128, chunk_size=512):
+                 n_sinks=8, d_state=128, expand=2, lora_rank=4, group_size=4, chunk_size=128):
         super().__init__()
         assert n_layers % group_size == 0
         self.d_model = d_model
@@ -400,12 +433,12 @@ class HALOModel(nn.Module):
         self.embed = nn.Embedding(vocab_size, d_model)
 
         self.layers = nn.ModuleList([
-            HALOLayer(d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, k_cand, chunk_size)
+            HALOLayer(d_model, n_heads, window, topk, n_sinks, d_state, expand, lora_rank, chunk_size)
             for _ in range(n_layers)
         ])
 
         self.hyperlora = HyperLoRAGenerator(d_model, self.n_blocks, rank=lora_rank, n_sinks=n_sinks)
-
+        self.pooler = MultiScalePooler(d_model, d_model)
         self.pool_norm = nn.LayerNorm(d_model)
         self.final_norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -416,20 +449,24 @@ class HALOModel(nn.Module):
             
         x = self.embed(input_ids)
         b, n, d = x.shape
-        
         n_chunks = (n + self.chunk_size - 1) // self.chunk_size
-        g_list = []
-        
-        for c in range(n_chunks):
-            start = c * self.chunk_size
-            if start == 0:
-                g_c = self.pool_norm(x[:, 0])
-            else:
-                g_c = self.pool_norm(x[:, start - 1])
-            g_list.append(g_c)
 
         for block_idx in range(self.n_blocks):
+            g_list = []
+            for c in range(n_chunks):
+                start = c * self.chunk_size
+                if start == 0:
+                    g_c = self.pool_norm(x[:, 0])
+                else:
+                    past_end = start
+                    past_start = max(0, past_end - 256)
+                    x_past = x[:, past_start:past_end]
+                    m_past = attention_mask[:, past_start:past_end] if attention_mask is not None else None
+                    g_c = self.pool_norm(self.pooler(x_past, m_past))
+                g_list.append(g_c)
+                
             halora_list = [self.hyperlora(g_c, block_idx) for g_c in g_list]
+            
             for layer_in_block in range(self.group_size):
                 layer_idx = block_idx * self.group_size + layer_in_block
                 x = self.layers[layer_idx](x, halora_list, attention_mask)
